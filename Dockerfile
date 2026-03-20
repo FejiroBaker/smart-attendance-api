@@ -20,13 +20,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY . .
 
-# Pre-download the InsightFace buffalo_sc model (~85 MB) at build time
-# so the container starts instantly without a network call at runtime.
+# Pre-download the InsightFace buffalo_sc model (~85 MB) at build time.
+# Using || true so a warmup failure doesn't break the build —
+# the model will download on first request instead.
 RUN python -c "\
 from insightface.app import FaceAnalysis; \
 app = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider']); \
 app.prepare(ctx_id=0, det_size=(640, 640)); \
-print('InsightFace model cached successfully')"
+print('InsightFace model cached successfully')" || echo "Warmup skipped - model will load at runtime"
 
 # Railway sets $PORT dynamically
 ENV PORT=8000
