@@ -2,8 +2,8 @@ fastapi==0.111.0
 uvicorn==0.30.1
 deepface==0.0.99
 tf-keras
-tensorflow
-opencv-python-headless
+tensorflow==2.21.0
+opencv-python-headless==4.8.0.76
 numpy
 Pillow
 python-multipart==0.0.9
