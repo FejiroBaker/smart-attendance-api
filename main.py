@@ -1,5 +1,8 @@
 # python_backend/main.py
 
+import os
+import sys
+
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -18,10 +21,9 @@ from models import (
 app = FastAPI(
     title="Smart Attendance Face Recognition API",
     description="Python backend for face detection, recognition and embedding storage",
-    version="1.0.0"
+    version="2.0.0"
 )
 
-# Allow requests from Flutter app (all origins for local dev)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,9 +35,21 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database on startup."""
+    """Initialize database and warm up InsightFace models on startup."""
+    print("Starting Smart Attendance Face Recognition API...")
+
+    # Init SQLite
     database.init_db()
-    print("Smart Attendance Face Recognition API started")
+
+    # Warm up InsightFace — downloads buffalo_sc (~85 MB) on first run,
+    # then caches it. Subsequent starts are instant.
+    try:
+        print("Loading InsightFace models (first run downloads ~85 MB)...")
+        face_service.warmup()
+    except Exception as e:
+        print(f"Warning: InsightFace warmup failed: {e}", file=sys.stderr)
+
+    print("API startup complete.")
 
 
 # ─────────────────────────────────────────────
@@ -44,7 +58,6 @@ async def startup_event():
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Check if the API is running."""
     registered_count = database.get_registered_count()
     return HealthResponse(
         status="ok",
@@ -58,15 +71,10 @@ async def health_check():
 
 @app.post("/detect", response_model=DetectFacesResponse)
 async def detect_faces(image: UploadFile = File(...)):
-    """
-    Detect all faces in an uploaded image.
-    Returns bounding boxes and confidence scores.
-    Flutter sends camera frame as JPEG bytes.
-    """
+    """Detect all faces in an uploaded image."""
     try:
         image_bytes = await image.read()
         detected_faces, _ = face_service.detect_faces(image_bytes)
-
         return DetectFacesResponse(
             success=True,
             faces=detected_faces,
@@ -87,22 +95,14 @@ async def register_face(
     student_id: int = Form(...),
     student_name: str = Form(...)
 ):
-    """
-    Register a student's face.
-    Detects face, extracts 128-dim embedding, and stores it in SQLite.
-    Flutter sends: image file + student_id + student_name as form data.
-    """
+    """Register a student's face — extracts and stores the embedding."""
     try:
         image_bytes = await image.read()
         result = face_service.register_face(image_bytes, student_id, student_name)
 
         if not result["success"]:
-            return RegisterFaceResponse(
-                success=False,
-                message=result["message"]
-            )
+            return RegisterFaceResponse(success=False, message=result["message"])
 
-        # Save embedding to database
         saved = database.save_embedding(
             student_id=student_id,
             student_name=student_name,
@@ -135,15 +135,10 @@ async def recognize_face(
     image: UploadFile = File(...),
     exclude_ids: Optional[str] = Form(default=None)
 ):
-    """
-    Recognize a face in an image against all stored embeddings.
-    Flutter sends: image file + optional comma-separated exclude_ids.
-    Returns matched student info if found.
-    """
+    """Recognize a face against all stored embeddings."""
     try:
         image_bytes = await image.read()
 
-        # Parse excluded student IDs (already marked today)
         excluded = []
         if exclude_ids:
             try:
@@ -151,7 +146,6 @@ async def recognize_face(
             except ValueError:
                 pass
 
-        # Load all stored embeddings
         stored_embeddings = database.get_all_embeddings()
 
         if not stored_embeddings:
@@ -160,7 +154,6 @@ async def recognize_face(
                 message="No registered faces in database"
             )
 
-        # Run recognition
         result = face_service.recognize_face(image_bytes, stored_embeddings, excluded)
 
         return RecognizeFaceResponse(
@@ -181,10 +174,7 @@ async def recognize_face(
 
 @app.delete("/face/{student_id}", response_model=DeleteFaceResponse)
 async def delete_face(student_id: int):
-    """
-    Delete a student's registered face embedding.
-    Called when a student is deleted from the app.
-    """
+    """Delete a student's registered face embedding."""
     deleted = database.delete_embedding(student_id)
     if deleted:
         return DeleteFaceResponse(
@@ -219,9 +209,10 @@ async def get_registered_count():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",  # Listen on all interfaces so Flutter can reach it
-        port=8000,
-        reload=True
+        host="0.0.0.0",
+        port=port,
+        reload=False,
     )

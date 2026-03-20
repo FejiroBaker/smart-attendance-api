@@ -1,71 +1,94 @@
 # python_backend/face_service.py
+
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '0'
 
 import numpy as np
 from PIL import Image
 import io
 from typing import Optional, List, Tuple
-from deepface import DeepFace
 from models import DetectedFace, StoredEmbedding
 
-RECOGNITION_THRESHOLD = 0.4
-MODEL_NAME = "Facenet"
-DETECTOR_BACKEND = "opencv"
+RECOGNITION_THRESHOLD = 0.5   # cosine distance; lower = stricter match
 
+# InsightFace app — loaded once at module level
+_face_app = None
+
+
+def _get_face_app():
+    """Lazy-load InsightFace so import errors surface clearly."""
+    global _face_app
+    if _face_app is None:
+        from insightface.app import FaceAnalysis
+        _face_app = FaceAnalysis(
+            name="buffalo_sc",                    # small but accurate model (~85 MB)
+            providers=["CPUExecutionProvider"],
+        )
+        _face_app.prepare(ctx_id=0, det_size=(640, 640))
+        print("InsightFace model loaded.")
+    return _face_app
+
+
+def warmup():
+    """Call at startup to pre-load the model and avoid first-request lag."""
+    try:
+        app = _get_face_app()
+        dummy = np.zeros((160, 160, 3), dtype=np.uint8)
+        app.get(dummy)
+        print("InsightFace warmup complete.")
+    except Exception as e:
+        print(f"InsightFace warmup warning: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Image helpers
+# ─────────────────────────────────────────────────────────────
 
 def decode_image(image_bytes: bytes) -> Optional[np.ndarray]:
-    """Decode image bytes to numpy array (RGB)."""
+    """Decode JPEG/PNG bytes to BGR numpy array (OpenCV convention)."""
     try:
         pil_image = Image.open(io.BytesIO(image_bytes))
         if pil_image.mode != "RGB":
             pil_image = pil_image.convert("RGB")
-        return np.array(pil_image)
+        # InsightFace expects BGR
+        rgb = np.array(pil_image)
+        return rgb[:, :, ::-1].copy()   # RGB to BGR
     except Exception as e:
         print(f"Error decoding image: {e}")
         return None
 
 
-def _get_cv2():
-    """Lazy import cv2 to avoid startup crash."""
-    import cv2
-    return cv2
-
+# ─────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────
 
 def detect_faces(image_bytes: bytes) -> Tuple[List[DetectedFace], Optional[np.ndarray]]:
-    """Detect all faces in an image."""
+    """
+    Detect all faces in the image.
+    Returns (list of DetectedFace, bgr image array).
+    """
     image_array = decode_image(image_bytes)
     if image_array is None:
         return [], None
 
     try:
-        faces = DeepFace.extract_faces(
-            img_path=image_array,
-            detector_backend=DETECTOR_BACKEND,
-            enforce_detection=False,
-            align=True,
-        )
-
-        detected = []
+        faces = _get_face_app().get(image_array)
         h, w = image_array.shape[:2]
+        detected = []
 
         for face in faces:
-            if face.get("confidence", 0) < 0.5:
+            score = float(face.det_score)
+            if score < 0.4:
                 continue
-            region = face.get("facial_area", {})
-            left = max(0, region.get("x", 0))
-            top = max(0, region.get("y", 0))
-            width = region.get("w", 0)
-            height = region.get("h", 0)
-            right = min(w, left + width)
-            bottom = min(h, top + height)
-            face_region = image_array[top:bottom, left:right]
-            quality = _estimate_face_quality(face_region)
+            x1, y1, x2, y2 = face.bbox.astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
             detected.append(DetectedFace(
-                left=float(left), top=float(top),
-                right=float(right), bottom=float(bottom),
-                confidence=round(quality, 4),
+                left=float(x1),
+                top=float(y1),
+                right=float(x2),
+                bottom=float(y2),
+                confidence=round(score, 4),
             ))
 
         return detected, image_array
@@ -74,57 +97,31 @@ def detect_faces(image_bytes: bytes) -> Tuple[List[DetectedFace], Optional[np.nd
         return [], image_array
 
 
-def extract_embedding(image_array: np.ndarray) -> Optional[List[float]]:
-    """Extract face embedding using DeepFace + Facenet."""
-    try:
-        result = DeepFace.represent(
-            img_path=image_array,
-            model_name=MODEL_NAME,
-            detector_backend=DETECTOR_BACKEND,
-            enforce_detection=False,
-            align=True,
-        )
-        if result and len(result) > 0:
-            return result[0]["embedding"]
-        return None
-    except Exception as e:
-        print(f"Error extracting embedding: {e}")
-        return None
-
-
 def register_face(image_bytes: bytes, student_id: int, student_name: str) -> dict:
-    """Detect face and extract embedding for registration."""
+    """
+    Detect face and extract embedding for registration.
+    Does NOT write to the database — the caller (main.py) does that.
+    """
     image_array = decode_image(image_bytes)
     if image_array is None:
         return {"success": False, "message": "Failed to decode image"}
 
     try:
-        faces = DeepFace.extract_faces(
-            img_path=image_array,
-            detector_backend=DETECTOR_BACKEND,
-            enforce_detection=False,
-            align=True,
-        )
-        valid_faces = [f for f in faces if f.get("confidence", 0) >= 0.5]
+        faces = _get_face_app().get(image_array)
+        valid = [f for f in faces if float(f.det_score) >= 0.5]
 
-        if not valid_faces:
-            return {"success": False, "message": "No face detected. Please face the camera directly."}
-        if len(valid_faces) > 1:
-            return {"success": False, "message": f"Multiple faces detected ({len(valid_faces)}). Only one person allowed."}
+        if not valid:
+            return {"success": False, "message": "No face detected. Face the camera directly."}
+        if len(valid) > 1:
+            return {"success": False, "message": f"Multiple faces detected ({len(valid)}). One person only."}
 
-        face = valid_faces[0]
-        region = face.get("facial_area", {})
-        left, top = region.get("x", 0), region.get("y", 0)
-        w, h = region.get("w", 0), region.get("h", 0)
-        face_region = image_array[top:top+h, left:left+w]
-        quality = _estimate_face_quality(face_region)
+        face = valid[0]
+        quality = _estimate_quality(image_array, face.bbox.astype(int))
 
-        if quality < 0.35:
-            return {"success": False, "message": "Face quality too low. Ensure good lighting."}
+        if quality < 0.3:
+            return {"success": False, "message": "Face quality too low. Improve lighting."}
 
-        embedding = extract_embedding(image_array)
-        if embedding is None:
-            return {"success": False, "message": "Failed to extract face features"}
+        embedding: List[float] = face.embedding.tolist()
 
         return {
             "success": True,
@@ -143,7 +140,10 @@ def recognize_face(
     stored_embeddings: List[StoredEmbedding],
     exclude_student_ids: List[int] = None,
 ) -> dict:
-    """Recognize a face against stored embeddings."""
+    """
+    Recognize the face in the image against all stored embeddings.
+    Returns matched student info if found.
+    """
     if not stored_embeddings:
         return {"success": False, "message": "No registered faces in database"}
 
@@ -152,34 +152,21 @@ def recognize_face(
         return {"success": False, "message": "Failed to decode image"}
 
     try:
-        faces = DeepFace.extract_faces(
-            img_path=image_array,
-            detector_backend=DETECTOR_BACKEND,
-            enforce_detection=False,
-            align=True,
-        )
-        valid_faces = [f for f in faces if f.get("confidence", 0) >= 0.5]
+        faces = _get_face_app().get(image_array)
+        valid = [f for f in faces if float(f.det_score) >= 0.5]
 
-        if not valid_faces:
+        if not valid:
             return {"success": False, "message": "No face detected"}
-        if len(valid_faces) > 1:
+        if len(valid) > 1:
             return {"success": False, "message": "Multiple faces detected. One at a time."}
 
-        face = valid_faces[0]
-        region = face.get("facial_area", {})
-        left, top = region.get("x", 0), region.get("y", 0)
-        w, h = region.get("w", 0), region.get("h", 0)
-        face_region = image_array[top:top+h, left:left+w]
-        quality = _estimate_face_quality(face_region)
+        face = valid[0]
+        quality = _estimate_quality(image_array, face.bbox.astype(int))
 
-        if quality < 0.3:
+        if quality < 0.25:
             return {"success": False, "message": "Face not clear enough. Adjust lighting."}
 
-        query_embedding = extract_embedding(image_array)
-        if query_embedding is None:
-            return {"success": False, "message": "Failed to process face"}
-
-        query_array = np.array(query_embedding)
+        query_vec = face.embedding   # already L2-normalised by InsightFace
 
         candidates = stored_embeddings
         if exclude_student_ids:
@@ -192,9 +179,9 @@ def recognize_face(
         best_match = None
 
         for stored in candidates:
-            distance = _cosine_distance(query_array, np.array(stored.embedding))
-            if distance < best_distance:
-                best_distance = distance
+            dist = _cosine_distance(query_vec, np.array(stored.embedding, dtype=np.float32))
+            if dist < best_distance:
+                best_distance = dist
                 best_match = stored
 
         confidence = round(max(0.0, 1.0 - best_distance), 4)
@@ -220,40 +207,43 @@ def recognize_face(
         return {"success": False, "message": f"Error: {str(e)}"}
 
 
-def _cosine_distance(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    """Cosine distance between two vectors (0=identical)."""
-    norm1 = np.linalg.norm(vec1)
-    norm2 = np.linalg.norm(vec2)
-    if norm1 == 0 or norm2 == 0:
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
+
+def _cosine_distance(v1: np.ndarray, v2: np.ndarray) -> float:
+    """Cosine distance between two vectors (0 = identical, 1 = opposite)."""
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 == 0 or n2 == 0:
         return 1.0
-    return float(1.0 - np.dot(vec1, vec2) / (norm1 * norm2))
+    return float(1.0 - np.dot(v1, v2) / (n1 * n2))
 
 
-def _estimate_face_quality(face_region: np.ndarray) -> float:
-    """Estimate face quality using PIL only — no cv2 needed."""
-    if face_region is None or face_region.size == 0:
+def _estimate_quality(bgr: np.ndarray, bbox: np.ndarray) -> float:
+    """
+    Heuristic face quality score in [0, 1] based on size, sharpness, brightness.
+    Pure numpy — no cv2 needed.
+    """
+    x1, y1, x2, y2 = bbox
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(bgr.shape[1], x2), min(bgr.shape[0], y2)
+    face_region = bgr[y1:y2, x1:x2]
+
+    if face_region.size == 0:
         return 0.0
 
-    height, width = face_region.shape[:2]
+    h, w = face_region.shape[:2]
+    size_score = min(1.0, (w * h) / (80 * 80))
 
-    # Size score
-    size_score = min(1.0, (width * height) / (80 * 80))
-
-    # Sharpness using numpy (no cv2)
-    if len(face_region.shape) == 3:
-        gray = np.mean(face_region, axis=2)
-    else:
-        gray = face_region.astype(float)
-
-    # Simple Laplacian variance using numpy
-    laplacian = (
+    gray = np.mean(face_region, axis=2).astype(float)
+    lap = (
         np.roll(gray, -1, axis=0) + np.roll(gray, 1, axis=0) +
         np.roll(gray, -1, axis=1) + np.roll(gray, 1, axis=1) -
         4 * gray
     )
-    sharpness_score = min(1.0, float(np.var(laplacian)) / 500.0)
+    sharpness_score = min(1.0, float(np.var(lap)) / 500.0)
 
-    # Brightness score
     mean_brightness = float(np.mean(gray))
     if 60 <= mean_brightness <= 200:
         brightness_score = 1.0
@@ -262,5 +252,4 @@ def _estimate_face_quality(face_region: np.ndarray) -> float:
     else:
         brightness_score = max(0.0, 1.0 - (mean_brightness - 200) / 55.0)
 
-    quality = size_score * 0.3 + sharpness_score * 0.5 + brightness_score * 0.2
-    return round(min(1.0, quality), 4)
+    return round(min(1.0, size_score * 0.3 + sharpness_score * 0.5 + brightness_score * 0.2), 4)
