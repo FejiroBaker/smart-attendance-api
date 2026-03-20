@@ -1,9 +1,9 @@
 # python_backend/face_service.py
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Suppress TF warnings
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '0'
 
 import numpy as np
-import cv2
 from PIL import Image
 import io
 from typing import Optional, List, Tuple
@@ -16,15 +16,21 @@ DETECTOR_BACKEND = "opencv"
 
 
 def decode_image(image_bytes: bytes) -> Optional[np.ndarray]:
-    """Decode image bytes to numpy array (BGR for OpenCV)."""
+    """Decode image bytes to numpy array (RGB)."""
     try:
         pil_image = Image.open(io.BytesIO(image_bytes))
         if pil_image.mode != "RGB":
             pil_image = pil_image.convert("RGB")
-        return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        return np.array(pil_image)
     except Exception as e:
         print(f"Error decoding image: {e}")
         return None
+
+
+def _get_cv2():
+    """Lazy import cv2 to avoid startup crash."""
+    import cv2
+    return cv2
 
 
 def detect_faces(image_bytes: bytes) -> Tuple[List[DetectedFace], Optional[np.ndarray]]:
@@ -224,13 +230,30 @@ def _cosine_distance(vec1: np.ndarray, vec2: np.ndarray) -> float:
 
 
 def _estimate_face_quality(face_region: np.ndarray) -> float:
-    """Estimate face quality: size + sharpness + brightness."""
+    """Estimate face quality using PIL only — no cv2 needed."""
     if face_region is None or face_region.size == 0:
         return 0.0
+
     height, width = face_region.shape[:2]
+
+    # Size score
     size_score = min(1.0, (width * height) / (80 * 80))
-    gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY) if len(face_region.shape) == 3 else face_region
-    sharpness_score = min(1.0, cv2.Laplacian(gray, cv2.CV_64F).var() / 500.0)
+
+    # Sharpness using numpy (no cv2)
+    if len(face_region.shape) == 3:
+        gray = np.mean(face_region, axis=2)
+    else:
+        gray = face_region.astype(float)
+
+    # Simple Laplacian variance using numpy
+    laplacian = (
+        np.roll(gray, -1, axis=0) + np.roll(gray, 1, axis=0) +
+        np.roll(gray, -1, axis=1) + np.roll(gray, 1, axis=1) -
+        4 * gray
+    )
+    sharpness_score = min(1.0, float(np.var(laplacian)) / 500.0)
+
+    # Brightness score
     mean_brightness = float(np.mean(gray))
     if 60 <= mean_brightness <= 200:
         brightness_score = 1.0
@@ -238,4 +261,6 @@ def _estimate_face_quality(face_region: np.ndarray) -> float:
         brightness_score = mean_brightness / 60.0
     else:
         brightness_score = max(0.0, 1.0 - (mean_brightness - 200) / 55.0)
-    return round(min(1.0, size_score * 0.3 + sharpness_score * 0.5 + brightness_score * 0.2), 4)
+
+    quality = size_score * 0.3 + sharpness_score * 0.5 + brightness_score * 0.2
+    return round(min(1.0, quality), 4)
