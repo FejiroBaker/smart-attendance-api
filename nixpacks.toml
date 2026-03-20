@@ -1,3 +1,6 @@
+[phases.setup]
+nixPkgs = ["libxcb", "libGL"]
+
 [phases.install]
 cmds = [
     "pip install opencv-python-headless==4.8.0.76",
